@@ -7,7 +7,6 @@ from collections import OrderedDict
 class _DenseLayer(nn.Sequential):
     def __init__(self, num_input_features, growth_rate, bn_size, drop_rate, padding):
         super().__init__()
-        self.add_module("relu1", nn.ReLU(inplace=False))
         self.add_module(
             "conv1",
             nn.Conv3d(
@@ -18,7 +17,7 @@ class _DenseLayer(nn.Sequential):
                 bias=False,
             ),
         )
-        self.add_module("relu2", nn.ReLU(inplace=False))
+        self.add_module("relu1", nn.ReLU(inplace=False))
         self.add_module(
             "conv2",
             nn.Conv3d(
@@ -30,6 +29,7 @@ class _DenseLayer(nn.Sequential):
                 bias=False,
             ),
         )
+        self.add_module("relu2", nn.ReLU(inplace=False))
         self.drop_rate = drop_rate
 
     def forward(self, x):
@@ -70,7 +70,6 @@ class _DenseBlock(nn.Sequential):
 class _Transition(nn.Sequential):
     def __init__(self, num_input_features, num_output_features, padding):
         super().__init__()
-        self.add_module("relu", nn.ReLU(inplace=False))
         self.add_module(
             "conv",
             nn.Conv3d(
@@ -82,6 +81,7 @@ class _Transition(nn.Sequential):
                 padding=padding,
             ),
         )
+        self.add_module("relu", nn.ReLU(inplace=False))
 
 
 class DenseNet(nn.Module):
@@ -103,22 +103,26 @@ class DenseNet(nn.Module):
         growth_rate=32,
         block_config=(6, 12, 24, 16),
         num_init_features=64,
+        num_embeddings=8,
         bn_size=4,
         drop_rate=0,
         padding="valid",
+        upsample_mode: str = "nearest",
     ):
 
         super().__init__()
 
+        self.num_embeddings = num_embeddings
+
         # First convolution
-        self.features = [
+        first_conv = [
             (
                 "conv1",
                 nn.Conv3d(
                     n_input_channels,
                     num_init_features,
-                    kernel_size=(3, 3, 3),
-                    stride=(1, 1, 1),
+                    kernel_size=1,
+                    stride=1,
                     bias=False,
                     padding=padding,
                 ),
@@ -126,7 +130,7 @@ class DenseNet(nn.Module):
             ("relu1", nn.ReLU(inplace=False)),
         ]
 
-        self.features = nn.Sequential(OrderedDict(self.features))
+        self.features = nn.Sequential(OrderedDict(first_conv))
 
         # Each denseblock
         num_features = num_init_features
@@ -141,23 +145,34 @@ class DenseNet(nn.Module):
             )
             self.features.add_module("denseblock{}".format(i + 1), block)
             num_features = num_features + num_layers * growth_rate
-            if i != len(block_config) - 1:
-                trans = _Transition(
-                    num_input_features=num_features,
-                    num_output_features=num_features // 2,
-                    padding=padding,
-                )
-                self.features.add_module("transition{}".format(i + 1), trans)
-                num_features = num_features // 2
+            trans = _Transition(
+                num_input_features=num_features,
+                num_output_features=num_init_features,
+                padding=padding,
+            )
+            self.features.add_module("transition{}".format(i + 1), trans)
+            num_features = num_init_features
+        self.features.add_module(
+            "embeddings", torch.nn.Conv3d(num_init_features, num_embeddings, 1)
+        )
 
         for m in self.modules():
             if isinstance(m, nn.Conv3d):
-                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                nn.init.kaiming_normal_(m.weight, mode="fan_in", nonlinearity="relu")
 
-        self.final_layer = nn.Conv3d(num_features, n_output_channels, (1, 1, 1))
+        self.final_layer = nn.Conv3d(num_embeddings, n_output_channels, (1, 1, 1))
+        self.upsample = torch.nn.Upsample(scale_factor=2, mode=upsample_mode)
 
-    def forward(self, x):
-        features = self.features(x)
+    def forward(self, raw, upsampled=None):
+        if upsampled is None:
+            upsampled_shape = list(raw.shape)
+            upsampled_shape[1] = self.num_embeddings
+            upsampled = torch.zeros(upsampled_shape)
+        x = torch.cat([raw, upsampled], dim=1)
+        features = self.upsample(self.features(x))
         out = F.relu(features, inplace=False)
         final = self.final_layer(out)
-        return final
+        if self.training:
+            return features, final
+        else:
+            return features, torch.nn.Softmax(dim=1)(final)

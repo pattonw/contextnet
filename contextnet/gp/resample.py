@@ -54,19 +54,29 @@ class Resample(BatchFilter):
     def setup(self):
         spec = self.spec[self.source].copy()
         spec.voxel_size = self.target_voxel_size
-        self.provides(self.target, spec)
+        spec.roi = spec.roi.snap_to_grid(spec.voxel_size, mode="shrink")
+        if self.target == self.source:
+            self.updates(self.target, spec)
+        else:
+            self.provides(self.target, spec)
         self.enable_autoskip()
 
     def prepare(self, request):
-        source_voxel_size = self.spec[self.source].voxel_size
+        source_voxel_size = self.upstream_providers[0].spec[self.source].voxel_size
         source_request = request[self.target].copy()
         source_request.voxel_size = source_voxel_size
+        lcm_voxel_size = Coordinate(np.lcm(source_voxel_size, self.target_voxel_size))
         source_request.roi = source_request.roi.snap_to_grid(
-            np.lcm(source_voxel_size, self.target_voxel_size), mode="grow"
+            lcm_voxel_size, mode="grow"
         )
         source_request.roi = source_request.roi.grow(
-            self.target_voxel_size, self.target_voxel_size
+            lcm_voxel_size, lcm_voxel_size
         )  # Pad w/ 1 voxel per side for interpolation to avoid edge effects
+        source_request.roi = source_request.roi.intersect(
+            self.upstream_providers[0].spec[self.source].roi
+        ).snap_to_grid(lcm_voxel_size, mode="shrink")
+
+        assert source_request.roi.contains(request[self.target].roi)
 
         deps = BatchRequest()
         deps[self.source] = source_request
@@ -76,9 +86,12 @@ class Resample(BatchFilter):
     def process(self, batch, request):
         source = batch.arrays[self.source]
         source_data = source.data
-        source_voxel_size = self.spec[self.source].voxel_size
+        source_voxel_size = self.upstream_providers[0].spec[self.source].voxel_size
 
         scales = np.array(source_voxel_size) / np.array(self.target_voxel_size)
+        scales = np.array(
+            (1,) * (len(source_data.shape) - source_voxel_size.dims) + tuple(scales)
+        )
 
         if self.interp_order != 0 and (
             self.spec[self.source].interpolatable
@@ -99,7 +112,8 @@ class Resample(BatchFilter):
         target_spec = source.spec.copy()
         target_spec.roi = Roi(
             source.spec.roi.get_begin(),
-            self.target_voxel_size * Coordinate(resampled_data.shape),
+            self.target_voxel_size
+            * Coordinate(resampled_data.shape[-source_voxel_size.dims :]),
         )
         target_spec.voxel_size = self.target_voxel_size
         target_spec.dtype = resampled_data.dtype
