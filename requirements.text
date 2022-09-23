@@ -8,3 +8,4 @@ yaml
 gunpowder
 git+https://github.com/funkelab/funlib.geometry
 git+https://github.com/funkelab/daisy
+git+https://github.com/pattonw/lsd@no-convenience-imports
