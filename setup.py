@@ -31,7 +31,7 @@ setup(
     description="Library and Scripts for training volumetric models with infinite context",
     entry_points={
         'console_scripts': [
-            'contextnet=contextnet.cli:main',
+            'contextnet=contextnet.cli.cli:main',
         ],
     },
     install_requires=requirements,
