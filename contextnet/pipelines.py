@@ -18,6 +18,7 @@ from .gp.pad import Pad
 from .gp.binarize import Binarize
 from .gp.scale_provider import ScaleProvider
 from .gp.elastic_augment import ElasticAugment
+from .gp.reject_if_empty import RejectIfEmpty
 
 
 class ArraySource(gp.BatchProvider):
@@ -61,13 +62,11 @@ class GTMaskSource(gp.BatchProvider):
         for organelle, dataset in self.datasets.items():
             if crop_data is None:
                 crop_data = np.zeros(
-                    (len(self.data_config.categories) + 1,)
-                    + dataset.to_ndarray(roi).shape,
+                    (len(self.data_config.categories),) + dataset.to_ndarray(roi).shape,
                     dtype=np.uint8,
                 )
                 crop_mask = np.zeros(
-                    (len(self.data_config.categories) + 1,)
-                    + dataset.to_ndarray(roi).shape,
+                    (len(self.data_config.categories),) + dataset.to_ndarray(roi).shape,
                     dtype=np.uint8,
                 )
 
@@ -76,7 +75,6 @@ class GTMaskSource(gp.BatchProvider):
                 crop_data = np.stack(
                     [np.isin(data, group) for group in self.data_config.categories]
                 )
-                crop_data = np.stack([crop_data.sum(axis=0) == 0, *crop_data])
                 crop_mask = np.ones_like(crop_data)
 
             else:
@@ -98,32 +96,27 @@ class GTMaskSource(gp.BatchProvider):
                         # if this channels ids perfectly match organelle ids
                         # mask in everything, else mask in negatives
                         if len(ids) == len(group):
-                            crop_data[group_channel + 1] = mask
-                            crop_mask[group_channel + 1] = 1
+                            crop_data[group_channel] = mask
+                            crop_mask[group_channel] = 1
                         else:
-                            crop_mask[group_channel + 1] = np.max(
-                                np.stack((1 - mask, crop_mask[group_channel + 1])),
+                            crop_mask[group_channel] = np.max(
+                                np.stack((1 - mask, crop_mask[group_channel])),
                                 axis=0,
                             )
                     elif all([g_id not in ids for g_id in group]):
                         # if there is no overlap we can mask in positives
-                        group_mask = crop_mask[group_channel + 1]
+                        group_mask = crop_mask[group_channel]
                         stack_mask = np.stack((mask, group_mask))
                         intersect_mask = np.max(stack_mask, axis=0)
-                        crop_mask[group_channel + 1] = intersect_mask
+                        crop_mask[group_channel] = intersect_mask
                     else:
                         # if there is some overlap between ids and group, we
                         # don't know anything.
                         pass
                 # mask in everything for this channel
-                crop_data[channel + 1] = mask
-                crop_mask[channel + 1] = 1
+                crop_data[channel] = mask
+                crop_mask[channel] = 1
 
-        # background channel. All foreground regions are already masked in, keep them.
-        # any voxel that is background in all other channels can be kept.
-        crop_mask[0] = np.stack([crop_mask[0], crop_mask[1:].min(axis=0)]).max(axis=0)
-        # set groundtruth background. anywhere nothing else is foreground.
-        crop_data[0] = np.stack([crop_data[0], 1 - crop_data[1:].max(axis=0)]).max(axis=0)
         output = gp.Batch()
         output[self.gt_key] = gp.Array(
             crop_data.astype(np.uint8), gp.ArraySpec(roi, self.voxel_size, False)
@@ -136,46 +129,21 @@ class GTMaskSource(gp.BatchProvider):
 
 def source_from_dataset(
     datasets,
-    labels_key,
     gt_key,
-    weight_key,
+    mask_key,
     data_config,
     resolution,
-    gt_scale_keys,
-    mask_scale_keys,
 ):
 
     source = (
         GTMaskSource(
             gt_key,
-            weight_key,
+            mask_key,
             datasets,
             data_config,
         )
-        + Resample(
-            gt_key,
-            resolution,
-            gt_scale_keys[0],
-        )
-        + Resample(
-            gt_key,
-            resolution * 2,
-            gt_scale_keys[1],
-        )
-        + gp.Pad(gt_scale_keys[0], resolution * data_config.zero_pad)
-        + gp.Pad(gt_scale_keys[1], resolution * data_config.zero_pad * 2)
-        + Resample(
-            weight_key,
-            resolution,
-            mask_scale_keys[0],
-        )
-        + Resample(
-            weight_key,
-            resolution * 2,
-            mask_scale_keys[1],
-        )
-        + gp.Pad(mask_scale_keys[0], resolution * data_config.zero_pad)
-        + gp.Pad(mask_scale_keys[1], resolution * data_config.zero_pad * 2)
+        + gp.Pad(gt_key, resolution * data_config.zero_pad * 2)
+        + gp.Pad(mask_key, resolution * data_config.zero_pad * 2)
     )
     return source
 
@@ -320,7 +288,6 @@ def build_pipeline(
             gp.ArrayKey(f"RAW_LOW"),
             gp.ArrayKey(f"RAW_CONTEXT"),
         ]
-        labels_key = gp.ArrayKey("LABELS")
         gt_key = gp.ArrayKey("GT")
         mask_key = gp.ArrayKey("MASK")
         gt_scale_keys = [gp.ArrayKey(f"GT_HIGH"), gp.ArrayKey(f"GT_LOW")]
@@ -334,14 +301,10 @@ def build_pipeline(
                     (
                         source_from_dataset(
                             datasets,
-                            labels_key,
                             gt_key,
                             mask_key,
                             data_config,
                             resolution,
-                            gt_scale_keys,
-                            mask_scale_keys,
-                            # weight_scale_keys,
                         ),
                         gp.ZarrSource(
                             raw_datasets[resolution * 2].data.store.path,
@@ -375,6 +338,27 @@ def build_pipeline(
                     )
                     + gp.MergeProvider()
                     + gp.RandomLocation()
+                    + RejectIfEmpty(gt_key, p=0.8)
+                    + Resample(
+                        gt_key,
+                        resolution,
+                        gt_scale_keys[0],
+                    )
+                    + Resample(
+                        gt_key,
+                        resolution * 2,
+                        gt_scale_keys[1],
+                    )
+                    + Resample(
+                        mask_key,
+                        resolution,
+                        mask_scale_keys[0],
+                    )
+                    + Resample(
+                        mask_key,
+                        resolution * 2,
+                        mask_scale_keys[1],
+                    )
                     + ElasticAugment(
                         (10, 10, 10),
                         (3, 3, 3),
