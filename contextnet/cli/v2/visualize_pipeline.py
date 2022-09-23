@@ -88,7 +88,15 @@ def visualize_pipeline(scale_config, data_config, num_voxels, lsds):
                     scales=gt_scale_array.spec.voxel_size,
                 )
                 gt_vol = neuroglancer.LocalVolume(
-                    data=np.argmax(gt_scale_array.data, axis=0).astype(np.uint32),
+                    data=np.argmax(
+                        np.stack(
+                            [
+                                np.zeros_like(gt_scale_array.data[0]),
+                                *gt_scale_array.data,
+                            ]
+                        ),
+                        axis=0,
+                    ).astype(np.uint32),
                     voxel_offset=(-gt_scale_array.spec.roi.shape / 2)
                     / gt_scale_array.spec.voxel_size,
                     dimensions=dims,
@@ -147,7 +155,9 @@ def visualize_pipeline(scale_config, data_config, num_voxels, lsds):
                     ),
                     neuroglancer.column_layout(
                         [
-                            neuroglancer.LayerGroupViewer(layers=raw_names[::-1] + weight_names[::-1]),
+                            neuroglancer.LayerGroupViewer(
+                                layers=raw_names[::-1] + weight_names[::-1]
+                            ),
                         ]
                     ),
                     neuroglancer.column_layout(

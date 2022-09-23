@@ -63,7 +63,7 @@ def view_snapshots(scale_config, train_config, weights, loss, argmax):
             data = daisy_array.data
             seg = False
             if ndims == 5 and argmax and dataset not in weight_datasets:
-                data = np.argmax(data, axis=1).astype(np.uint32)
+                data = np.argmax(np.stack([np.zeros_like(data[0]), *data]), axis=1).astype(np.uint32)
                 ndims -= 1
                 seg = True
 
