@@ -1,3 +1,9 @@
+from .train import train
+from .view_snapshots import view_snapshots
+from .validate import validate
+from .validate_valid import validate_valid
+from .visualize_pipeline import visualize_pipeline
+
 from gunpowder.torch import Predict
 
 import click
@@ -11,116 +17,11 @@ def v1():
     pass
 
 
-@v1.command()
-@click.option("-s", "--scale-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-d", "--data-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-v", "--num-voxels", type=int, default=32)
-@click.option("--lsds/--no-lsds", type=bool, default=False)
-def visualize_pipeline(scale_config, data_config, num_voxels, lsds):
-    from contextnet.pipeline import build_pipeline, get_request, split_batch
-    from contextnet.configs import ScaleConfig, DataConfig
-
-    from funlib.geometry import Coordinate
-
-    import gunpowder as gp
-
-    import neuroglancer
-
-    scale_config = ScaleConfig(**yaml.safe_load(open(scale_config, "r").read()))
-    data_config = DataConfig(**yaml.safe_load(open(data_config, "r").read()))
-    pipeline = build_pipeline(
-        data_config, scale_config, gt_voxel_size=data_config.gt_voxel_size, lsds=lsds
-    )
-
-    volume_shape = Coordinate((num_voxels,) * 3) * 4
-
-    def load_batch(event):
-        with gp.build(pipeline):
-            batch = pipeline.request_batch(
-                get_request(volume_shape, scale_config, lsds=lsds)
-            )
-        if lsds:
-            raw, gt, _weights, _masks, _lsds, _lsd_mask = split_batch(
-                batch, scale_config, lsds=lsds
-            )
-        else:
-            raw, gt, _weights, _masks = split_batch(batch, scale_config, lsds=lsds)
-
-        with viewer.txn() as s:
-            while len(s.layers) > 0:
-                del s.layers[0]
-
-            # reverse order for raw so we can set opacity to 1, this
-            # way higher res raw replaces low res when available
-            for scale_level, raw_scale_array in list(enumerate(raw))[::-1]:
-
-                dims = neuroglancer.CoordinateSpace(
-                    names=["z", "y", "x"],
-                    units="nm",
-                    scales=raw_scale_array.spec.voxel_size,
-                )
-
-                raw_vol = neuroglancer.LocalVolume(
-                    data=raw_scale_array.data,
-                    voxel_offset=raw_scale_array.spec.roi.offset
-                    / raw_scale_array.spec.voxel_size,
-                    dimensions=dims,
-                )
-
-                s.layers[f"raw_s{scale_level}"] = neuroglancer.ImageLayer(
-                    source=raw_vol, opacity=1.0
-                )
-            for scale_level, gt_scale_array in enumerate(gt):
-                dims = neuroglancer.CoordinateSpace(
-                    names=["z", "y", "x"],
-                    units="nm",
-                    scales=gt_scale_array.spec.voxel_size,
-                )
-                gt_vol = neuroglancer.LocalVolume(
-                    data=gt_scale_array.data,
-                    voxel_offset=gt_scale_array.spec.roi.offset
-                    / gt_scale_array.spec.voxel_size,
-                    dimensions=dims,
-                )
-
-                s.layers[f"gt_s{scale_level}"] = neuroglancer.SegmentationLayer(
-                    source=gt_vol,
-                )
-            if lsds:
-                for scale_level, lsd_scale_array in enumerate(_lsds):
-                    dims = neuroglancer.CoordinateSpace(
-                        names=["c^", "z", "y", "x"],
-                        units="nm",
-                        scales=(1,) + tuple(lsd_scale_array.spec.voxel_size),
-                    )
-                    lsd_vol = neuroglancer.LocalVolume(
-                        data=lsd_scale_array.data,
-                        voxel_offset=(0,)
-                        + tuple(
-                            lsd_scale_array.spec.roi.offset
-                            / lsd_scale_array.spec.voxel_size
-                        ),
-                        dimensions=dims,
-                    )
-
-                    s.layers[f"lsd_s{scale_level}"] = neuroglancer.ImageLayer(
-                        source=lsd_vol,
-                    )
-            s.layout = "yz"
-
-    neuroglancer.set_server_bind_address("0.0.0.0")
-
-    viewer = neuroglancer.Viewer()
-
-    viewer.actions.add("load_batch", load_batch)
-
-    with viewer.config_state.txn() as s:
-        s.input_event_bindings.data_view["keyt"] = "load_batch"
-
-    print(viewer)
-    load_batch(None)
-
-    input("Enter to quit!")
+v1.add_command(train)
+v1.add_command(view_snapshots)
+v1.add_command(validate)
+v1.add_command(validate_valid)
+v1.add_command(visualize_pipeline)
 
 
 @v1.command()
@@ -156,223 +57,12 @@ def model_summary(model_config):
 
 
 @v1.command()
-@click.option("-s", "--scale-config", type=click.Path(exists=True, dir_okay=False))
 @click.option("-t", "--train-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("--weights/--no-weights", type=bool, default=False)
-@click.option("--loss/--no-loss", type=bool, default=False)
-@click.option("--argmax/--no-argmax", type=bool, default=False)
-def view_snapshots(scale_config, train_config, weights, loss, argmax):
-    from contextnet.configs import ScaleConfig, TrainConfig
-
-    import daisy
-
-    import neuroglancer
-
-    from scipy.special import softmax
-    import numpy as np
-
-    scale_config = ScaleConfig(**yaml.safe_load(open(scale_config, "r").read()))
-    train_config = TrainConfig(**yaml.safe_load(open(train_config, "r").read()))
-
-    neuroglancer.set_server_bind_address("0.0.0.0")
-
-    viewer = neuroglancer.Viewer()
-
-    raw_datasets = [
-        f"raw_s{scale_level}"
-        for scale_level in range(scale_config.num_raw_scale_levels)
-    ]
-    target_datasets = [
-        f"target_s{scale_level}"
-        for scale_level in range(scale_config.num_gt_scale_levels)
-    ]
-    pred_datasets = [
-        f"pred_s{scale_level}"
-        for scale_level in range(scale_config.num_raw_scale_levels)
-    ]
-    weight_datasets = [
-        f"weight_s{scale_level}"
-        for scale_level in range(scale_config.num_gt_scale_levels)
-    ]
-    loss_datasets = [
-        f"loss_s{scale_level}"
-        for scale_level in range(scale_config.num_gt_scale_levels)
-    ]
-
-    with viewer.txn() as s:
-        while len(s.layers) > 0:
-            del s.layers[0]
-        for raw_dataset in raw_datasets:
-            daisy_array = daisy.open_ds(
-                train_config.snapshot_container,
-                f"{raw_dataset}",
-            )
-
-            dims = neuroglancer.CoordinateSpace(
-                names=["iterations", "z", "y", "x"],
-                units="nm",
-                scales=(1, *daisy_array.voxel_size),
-            )
-
-            raw_vol = neuroglancer.LocalVolume(
-                data=daisy_array.data,
-                voxel_offset=(
-                    0,
-                    *(daisy_array.roi.offset / daisy_array.voxel_size),
-                ),
-                dimensions=dims,
-            )
-
-            s.layers[raw_dataset] = neuroglancer.ImageLayer(source=raw_vol, opacity=1.0)
-        for target_dataset in target_datasets:
-            daisy_array = daisy.open_ds(
-                train_config.snapshot_container,
-                f"{target_dataset}",
-            )
-
-            dims = neuroglancer.CoordinateSpace(
-                names=["iterations", "z", "y", "x"],
-                units="nm",
-                scales=(1, *daisy_array.voxel_size),
-            )
-
-            target_vol = neuroglancer.LocalVolume(
-                data=daisy_array.data,
-                voxel_offset=(
-                    0,
-                    *(daisy_array.roi.offset / daisy_array.voxel_size),
-                ),
-                dimensions=dims,
-            )
-
-            s.layers[target_dataset] = neuroglancer.SegmentationLayer(source=target_vol)
-        for pred_dataset in pred_datasets:
-            daisy_array = daisy.open_ds(
-                train_config.snapshot_container,
-                f"{pred_dataset}",
-            )
-            data = softmax(daisy_array.data, axis=1)
-            if argmax:
-                data = np.argmax(data, axis=1).astype(np.uint32)
-
-                dims = neuroglancer.CoordinateSpace(
-                    names=["iterations", "z", "y", "x"],
-                    units="nm",
-                    scales=(1, *daisy_array.voxel_size),
-                )
-                voxel_offset = (
-                    0,
-                    *(daisy_array.roi.offset / daisy_array.voxel_size),
-                )
-            else:
-
-                dims = neuroglancer.CoordinateSpace(
-                    names=["iterations", "c^", "z", "y", "x"],
-                    units="nm",
-                    scales=(1, 1, *daisy_array.voxel_size),
-                )
-                voxel_offset = (
-                    0,
-                    0,
-                    *(daisy_array.roi.offset / daisy_array.voxel_size),
-                )
-
-            pred_vol = neuroglancer.LocalVolume(
-                data=data,
-                voxel_offset=voxel_offset,
-                dimensions=dims,
-            )
-            if argmax:
-                s.layers[pred_dataset] = neuroglancer.SegmentationLayer(
-                    source=pred_vol,
-                )
-            else:
-                s.layers[pred_dataset] = neuroglancer.ImageLayer(
-                    source=pred_vol,
-                )
-
-        if weights:
-            for weight_dataset in weight_datasets:
-                daisy_array = daisy.open_ds(
-                    train_config.snapshot_container,
-                    f"{weight_dataset}",
-                )
-
-                dims = neuroglancer.CoordinateSpace(
-                    names=["iterations", "z", "y", "x"],
-                    units="nm",
-                    scales=(1, *daisy_array.voxel_size),
-                )
-
-                target_vol = neuroglancer.LocalVolume(
-                    data=daisy_array.data,
-                    voxel_offset=(
-                        0,
-                        *(daisy_array.roi.offset / daisy_array.voxel_size),
-                    ),
-                    dimensions=dims,
-                )
-
-                s.layers[weight_dataset] = neuroglancer.ImageLayer(source=target_vol)
-        if loss:
-            for loss_dataset in loss_datasets:
-                daisy_array = daisy.open_ds(
-                    train_config.snapshot_container,
-                    f"{loss_dataset}",
-                )
-
-                dims = neuroglancer.CoordinateSpace(
-                    names=["iterations", "z", "y", "x"],
-                    units="nm",
-                    scales=(1, *daisy_array.voxel_size),
-                )
-
-                target_vol = neuroglancer.LocalVolume(
-                    data=daisy_array.data,
-                    voxel_offset=(
-                        0,
-                        *(daisy_array.roi.offset / daisy_array.voxel_size),
-                    ),
-                    dimensions=dims,
-                )
-
-                s.layers[loss_dataset] = neuroglancer.ImageLayer(source=target_vol)
-
-        s.layout = neuroglancer.row_layout(
-            [
-                neuroglancer.column_layout(
-                    [
-                        neuroglancer.LayerGroupViewer(
-                            layers=raw_datasets[::-1] + target_datasets
-                        ),
-                    ]
-                ),
-                neuroglancer.column_layout(
-                    [
-                        neuroglancer.LayerGroupViewer(
-                            layers=raw_datasets[::-1]
-                            + pred_datasets
-                            + (loss_datasets if loss else [])
-                        ),
-                    ]
-                ),
-            ]
-        )
-
-    print(viewer)
-
-    input("Enter to quit!")
-
-
-@v1.command()
-@click.option("-s", "--scale-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-t", "--train-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-d", "--data-config", type=click.Path(exists=True, dir_okay=False))
 @click.option("--emb/--no-emb", type=bool, default=False)
 @click.option("--argmax/--no-argmax", type=bool, default=False)
 @click.option("-i", "--iteration", type=int, default=0)
-def view_validations(scale_config, train_config, data_config, emb, argmax, iteration):
-    from contextnet.configs import ScaleConfig, TrainConfig, DataConfig
+def view_validations(train_config, emb, argmax, iteration):
+    from contextnet.configs import TrainConfig, DataSetConfig
 
     import daisy
 
@@ -382,9 +72,9 @@ def view_validations(scale_config, train_config, data_config, emb, argmax, itera
     from scipy.special import softmax
     import numpy as np
 
-    scale_config = ScaleConfig(**yaml.safe_load(open(scale_config, "r").read()))
     train_config = TrainConfig(**yaml.safe_load(open(train_config, "r").read()))
-    data_config = DataConfig(**yaml.safe_load(open(data_config, "r").read()))
+    scale_config = train_config.scale_config
+    data_config = train_config.data_config
 
     neuroglancer.set_server_bind_address("0.0.0.0")
 
@@ -401,8 +91,9 @@ def view_validations(scale_config, train_config, data_config, emb, argmax, itera
         pred_layers = []
         emb_layers = []
         pred_data_s0 = None
-        for scale_level in range(scale_config.num_raw_scale_levels):
+        for scale_level in range(scale_config.num_eval_scale_levels):
             if scale_level == 0:
+                # pass
                 continue
             # raw
             try:
@@ -440,15 +131,14 @@ def view_validations(scale_config, train_config, data_config, emb, argmax, itera
                         i=iteration, crop=crop, scale=scale_level
                     ),
                 )
-                data = softmax(daisy_array.to_ndarray(daisy_array.roi), axis=0)
+                data = daisy_array.to_ndarray(daisy_array.roi)
+                if scale_level == 0:
+                    pred_data_s0 = data
                 if train_config.lsds:
                     data = data[:-10]
-                pred_data = np.argmax(data, axis=0).astype(np.uint32)
-                if scale_level == 0:
-                    pred_data_s0 = pred_data
 
                 if argmax:
-                    data = pred_data
+                    data = np.argmax(data, axis=0).astype(np.uint32)
                     dims = neuroglancer.CoordinateSpace(
                         names=["z", "y", "x"],
                         units="nm",
@@ -516,17 +206,15 @@ def view_validations(scale_config, train_config, data_config, emb, argmax, itera
         dataset = f"{crop}_gt"
         # compare prediction s0 to gt
         gt_data = gt_array.to_ndarray(gt_array.roi)
-        label_data = np.zeros_like(gt_data)
         for label, label_ids in enumerate(data_config.categories):
-            label_data[np.isin(gt_data, label_ids)] = label + 1
+            label_data = np.isin(gt_data, label_ids)
 
-        if pred_data_s0 is not None:
-            val_score = f1_score(
-                label_data.flatten(),
-                pred_data_s0.flatten(),
-                average=None,
-            )
-            print(f"f1 Scores: {val_score}")
+            if pred_data_s0 is not None:
+                val_score = f1_score(
+                    label_data.flatten(),
+                    pred_data_s0[label].flatten() > 0.5,
+                )
+                print(f"{label} f1 Scores: {val_score}")
 
         dims = neuroglancer.CoordinateSpace(
             names=["z", "y", "x"],
@@ -549,20 +237,35 @@ def view_validations(scale_config, train_config, data_config, emb, argmax, itera
     current_ind = 0
 
     with viewer.txn() as s:
-        for dataset_config in data_config.datasets:
-            for validation_crop in dataset_config.validation_crops:
+        for dataset_config_path in data_config.datasets:
+            dataset_config = DataSetConfig(
+                **yaml.safe_load(dataset_config_path.open("r").read())
+            )
+            store_config = dataset_config.raw
+            for validation_crop in dataset_config.validation:
+                if not validation_crop in [155]:
+                    # print(f"skipping crop {validation_crop} ({dataset_config.name})")
+                    # continue
+                    pass
                 try:
-                    gt_array = daisy.open_ds(
-                        dataset_config.dataset_container,
-                        dataset_config.gt_group.format(crop_num=validation_crop)
-                        + "/all",
-                    )
-                except FileNotFoundError:
-                    gt_array = daisy.open_ds(
-                        dataset_config.fallback_dataset_container,
-                        dataset_config.gt_group.format(crop_num=validation_crop)
-                        + "/all",
-                    )
+                    try:
+                        gt_array = daisy.open_ds(
+                            store_config.container.format(dataset=dataset_config.name),
+                            store_config.crop.format(
+                                crop_num=validation_crop, organelle="all"
+                            ),
+                        )
+                    except (FileNotFoundError, KeyError):
+                        gt_array = daisy.open_ds(
+                            store_config.fallback.format(dataset=dataset_config.name),
+                            store_config.crop.format(
+                                crop_num=validation_crop, organelle="all"
+                            ),
+                        )
+                except KeyError:
+                    print(f"Skipping crop {validation_crop}")
+                    continue
+
                 print(f"Adding layers for {validation_crop}")
                 raw, pred, emb, gt = add_layers(s, validation_crop, gt_array)
                 datasets.append((raw, pred, emb, gt))
@@ -602,1032 +305,31 @@ def view_validations(scale_config, train_config, data_config, emb, argmax, itera
 @click.option("-t", "--train-config", type=click.Path(exists=True, dir_okay=False))
 @click.option("-n", "--num-iter", type=int, default=1000)
 @click.option("-o", "--output", type=click.Path(exists=False))
-def plot_loss(train_config, num_iter, output):
+@click.option("-s", "--smooth", type=float, default=0)
+def plot_loss(train_config, num_iter, output, smooth):
     from contextnet.configs import TrainConfig
 
     import numpy as np
     import matplotlib.pyplot as plt
 
+    def smooth_func(scalars, weight):
+        last = scalars[0]
+        smoothed = list()
+        for point in scalars:
+            smoothed_val = last * weight + (1 - weight) * point
+            smoothed.append(smoothed_val)
+            last = smoothed_val
+
+        return smoothed
+
     train_config = TrainConfig(**yaml.safe_load(open(train_config, "r").read()))
 
     losses = [
-        tuple(float(loss) for loss in line.strip("[]()\n").split(","))
+        tuple(float(loss) for loss in line.strip("[]()\n").split(",") if len(loss) > 0)
         for line in list(train_config.loss_file.open().readlines())[-num_iter:]
     ]
     loss_resolutions = [np.array(loss_resolution) for loss_resolution in zip(*losses)]
 
     for loss_resolution in loss_resolutions:
-        plt.plot(loss_resolution)
+        plt.plot(smooth_func(loss_resolution, smooth))
     plt.savefig(f"{output}.png")
-
-
-@v1.command()
-@click.option("-m", "--model-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-s", "--scale-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-d", "--data-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-t", "--train-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("--workers/--no-workers", type=bool, default=True)
-def train(model_config, scale_config, data_config, train_config, workers):
-    from contextnet.configs import ScaleConfig, DataConfig, TrainConfig, BackboneConfig
-    from contextnet.backbones.dense import DenseNet
-    from contextnet.pipeline import build_pipeline, get_request, split_batch
-
-    from funlib.geometry import Coordinate
-
-    import gunpowder as gp
-    import daisy
-
-    from sklearn.metrics import f1_score
-    from tqdm import tqdm
-    import zarr
-    import torch
-    import numpy as np
-
-    assert torch.cuda.is_available(), "Cannot train reasonably without cuda!"
-
-    scale_config = ScaleConfig(**yaml.safe_load(open(scale_config, "r").read()))
-    model_config = BackboneConfig(**yaml.safe_load(open(model_config, "r").read()))
-    train_config = TrainConfig(**yaml.safe_load(open(train_config, "r").read()))
-    data_config = DataConfig(**yaml.safe_load(open(data_config, "r").read()))
-
-    model = DenseNet(
-        n_input_channels=model_config.raw_input_channels
-        + (
-            model_config.n_output_channels
-            if not model_config.embeddings
-            else model_config.num_embeddings
-        ),
-        n_output_channels=model_config.n_output_channels,
-        num_init_features=model_config.num_init_features,
-        num_embeddings=model_config.num_embeddings,
-        growth_rate=model_config.growth_rate,
-        block_config=model_config.block_config,
-        padding=model_config.padding,
-        upsample_mode=model_config.upsample_mode,
-    ).cuda()
-
-    if train_config.loss_file.exists():
-        loss_stats = [
-            tuple(float(x) for x in line.strip("[]()\n").split(","))
-            for line in train_config.loss_file.open("r").readlines()
-        ]
-    else:
-        loss_stats = []
-
-    if train_config.val_file.exists():
-        val_stats = [float(x) for x in train_config.val_file.open("r").readlines()]
-    else:
-        val_stats = []
-
-    snapshot_zarr = zarr.open(f"{train_config.snapshot_container}")
-
-    loss_func = torch.nn.CrossEntropyLoss(reduction="none")
-    lsd_loss_func = torch.nn.MSELoss(reduction="none")
-    optimizer = torch.optim.Adam(model.parameters(), lr=train_config.learning_rate)
-    scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.001, total_iters=train_config.warmup
-    )
-
-    torch.backends.cudnn.benchmark = True
-
-    if not train_config.checkpoint_dir.exists():
-        train_config.checkpoint_dir.mkdir(parents=True)
-    checkpoints = sorted([int(f.name) for f in train_config.checkpoint_dir.iterdir()])
-    most_recent = 0 if len(checkpoints) == 0 else checkpoints[-1]
-    if most_recent > 0:
-        weights = torch.load(train_config.checkpoint_dir / f"{most_recent}")
-        model.load_state_dict(weights)
-        print(f"Starting from: {most_recent}")
-        loss_stats = loss_stats[:most_recent]
-        val_stats = val_stats[:most_recent]
-    else:
-        print(f"Starting from scratch!")
-        loss_stats = []
-        val_stats = []
-
-    # paths
-    validation_pred_dataset = "volumes/val/{crop}/{i}/pred/scale_{scale}"
-    validation_emb_dataset = "volumes/val/{crop}/{i}/emb/scale_{scale}"
-    validation_raw_dataset = "volumes/val/{crop}/raw/scale_{scale}"
-
-    # get pipeline. Stack to create appropriate batch size, add precache
-    pipeline = build_pipeline(
-        data_config, scale_config, data_config.gt_voxel_size, lsds=train_config.lsds
-    )
-    pipeline += gp.Stack(train_config.batch_size)
-    if workers:
-        pipeline += gp.PreCache(num_workers=train_config.num_workers)
-
-    with gp.build(pipeline):
-
-        for i in tqdm(range(most_recent, train_config.num_iterations)):
-            batch_request = get_request(
-                train_config.input_shape_voxels
-                * data_config.gt_voxel_size
-                * scale_config.scale_factor,
-                scale_config,
-                lsds=train_config.lsds,
-            )
-            if not train_config.lsds:
-                raws, targets, weights, masks = split_batch(
-                    pipeline.request_batch(batch_request),
-                    scale_config,
-                    lsds=train_config.lsds,
-                )
-            else:
-                raws, targets, weights, masks, lsd_targets, lsd_masks = split_batch(
-                    pipeline.request_batch(batch_request),
-                    scale_config,
-                    lsds=train_config.lsds,
-                )
-
-            optimizer.zero_grad()
-
-            # forward pass
-            predictions = {}
-            for scale_level, raw in list(enumerate(raws))[::-1]:
-                raw_shape = raw.spec.roi.shape / raw.spec.voxel_size
-                previous_embeddings, previous_pred = predictions.get(
-                    scale_level + 1,
-                    (
-                        torch.zeros(
-                            (
-                                train_config.batch_size,
-                                model_config.num_embeddings,
-                                *raw_shape,
-                            )
-                        )
-                        .cuda()
-                        .float(),
-                        torch.zeros(
-                            (
-                                train_config.batch_size,
-                                model_config.n_output_channels,
-                                *raw_shape,
-                            )
-                        )
-                        .cuda()
-                        .float(),
-                    ),
-                )
-                # convert raw to tensor and add channel dim
-                torch_raw = torch.unsqueeze(
-                    torch.from_numpy(raw.data).cuda().float(), 1
-                )
-
-                if not model_config.embeddings:
-                    previous_pred = torch.nn.Softmax(dim=1)(
-                        previous_pred.cuda().float()
-                    )
-                else:
-                    previous_pred = previous_embeddings.cuda().float()
-
-                if Coordinate(previous_pred.shape[2:]) - Coordinate(
-                    torch_raw.shape[2:]
-                ) != Coordinate(0, 0, 0):
-                    upsampled_shape = Coordinate(previous_pred.shape[2:])
-                    context = (upsampled_shape - raw_shape) / 2
-                    previous_pred = previous_pred[
-                        (slice(None), slice(None))
-                        + tuple(slice(c, c + r) for c, r in zip(context, raw_shape))
-                    ]
-
-                if train_config.threshold_skew > 0:
-                    threshold = max(
-                        [random.random() for _ in range(train_config.threshold_skew)]
-                    )
-                else:
-                    threshold = 0
-                pred_mask = (
-                    torch.cuda.FloatTensor(*previous_pred.shape).uniform_() > threshold
-                )
-
-                embeddings, pred = model.forward(
-                    torch_raw.cuda().float(),
-                    previous_pred.cuda().float() * pred_mask,
-                )
-                predictions[scale_level] = (embeddings, pred)
-
-            losses = []
-            weighted_losses = []
-            if not train_config.lsds:
-                for scale_level, (target, weight, mask) in enumerate(
-                    zip(targets, weights, masks)
-                ):
-                    # convert raw to tensor and add batch dim
-                    torch_target = (
-                        torch.from_numpy(target.data.astype(np.int8)).cuda().long()
-                    )
-                    torch_weight = (
-                        torch.from_numpy(weight.data * mask.data).cuda().float()
-                    )
-                    emb, pred = predictions[scale_level]
-                    element_loss = loss_func(pred, torch_target)
-                    weighted_loss = element_loss * torch_weight
-
-                    weighted_losses.append(weighted_loss)
-                    loss = weighted_loss.mean()
-                    losses.append(loss)
-
-            else:
-                for scale_level, (
-                    target,
-                    weight,
-                    mask,
-                    lsd_target,
-                    lsd_mask,
-                ) in enumerate(zip(targets, weights, masks, lsd_targets, lsd_masks)):
-                    torch_target = (
-                        torch.from_numpy(target.data.astype(np.int8)).cuda().long()
-                    )
-                    torch_weight = (
-                        torch.from_numpy(weight.data * mask.data).cuda().float()
-                    )
-                    torch_lsd_target = torch.from_numpy(lsd_target.data).cuda().float()
-                    torch_lsd_mask = torch.from_numpy(lsd_mask.data).cuda().float()
-                    emb, pred = predictions[scale_level]
-                    element_loss = loss_func(pred[:, :-10], torch_target)
-                    lsd_loss = lsd_loss_func(pred[:, -10:], torch_lsd_target)
-                    weighted_loss = element_loss * torch_weight
-                    weighted_lsd_loss = lsd_loss * torch_lsd_mask
-
-                    weighted_losses.append(weighted_loss)
-                    loss = weighted_loss.mean() + weighted_lsd_loss.mean()
-                    losses.append(loss)
-
-            var, mean = torch.var_mean(pred)
-            print(f"var: {var.item()}, mean: {mean.item()}")
-            print(f"losses: {[loss.item() for loss in losses]}")
-
-            loss = sum(losses) / len(losses)
-            loss.backward()
-            optimizer.step()
-            scheduler.step()
-            loss_stats.append([l.item() for l in losses])
-
-            if i % train_config.checkpoint_interval == 0:
-                torch.save(model.state_dict(), train_config.checkpoint_dir / f"{i}")
-
-            if i % train_config.snapshot_interval == 0:
-                with train_config.loss_file.open("w") as f:
-                    f.write("\n".join([str(x) for x in loss_stats]))
-
-                snapshot_zarr.attrs["iterations"] = snapshot_zarr.attrs.get(
-                    "iterations", list()
-                ) + [i]
-                for scale_level, raw in enumerate(raws):
-                    dataset_name = f"raw_s{scale_level}"
-                    sample = raw.data[0]  # select a sample from batch
-                    if dataset_name not in snapshot_zarr:
-                        snapshot_raw = snapshot_zarr.create_dataset(
-                            dataset_name,
-                            shape=(0, *sample.shape),
-                            dtype=raw.data.dtype,
-                        )
-                        snapshot_raw.attrs["resolution"] = raw.spec.voxel_size
-                        snapshot_raw.attrs["offset"] = raw.spec.roi.offset
-                        snapshot_raw.attrs["axes"] = ["iteration^", "z", "y", "x"]
-                    else:
-                        snapshot_raw = snapshot_zarr[dataset_name]
-                    snapshot_raw.append(sample.reshape((1, *sample.shape)), axis=0)
-                for scale_level, target in enumerate(targets):
-                    dataset_name = f"target_s{scale_level}"
-                    sample = target.data[0]
-                    if dataset_name not in snapshot_zarr:
-                        snapshot_target = snapshot_zarr.create_dataset(
-                            dataset_name,
-                            shape=(0, *sample.shape),
-                            dtype=sample.dtype,
-                        )
-                        snapshot_target.attrs["resolution"] = target.spec.voxel_size
-                        snapshot_target.attrs["offset"] = target.spec.roi.offset
-                        snapshot_target.attrs["axes"] = [
-                            "iteration^",
-                            "c^",
-                            "z",
-                            "y",
-                            "x",
-                        ]
-                    else:
-                        snapshot_target = snapshot_zarr[dataset_name]
-                    snapshot_target.append(sample.reshape((1, *sample.shape)), axis=0)
-                for scale_level, (_, prediction) in predictions.items():
-                    sample = prediction.detach().cpu().numpy()[0]
-                    dataset_name = f"pred_s{scale_level}"
-                    if dataset_name not in snapshot_zarr:
-                        snapshot_pred = snapshot_zarr.create_dataset(
-                            dataset_name,
-                            shape=(0, *sample.shape),
-                            dtype=sample.dtype,
-                        )
-                        snapshot_pred.attrs["resolution"] = (
-                            raws[scale_level].spec.voxel_size / 2
-                        )
-                        snapshot_pred.attrs["offset"] = raws[
-                            scale_level
-                        ].spec.roi.offset
-                        snapshot_pred.attrs["axes"] = [
-                            "iteration^",
-                            "c^",
-                            "z",
-                            "y",
-                            "x",
-                        ]
-                    else:
-                        snapshot_pred = snapshot_zarr[dataset_name]
-                    snapshot_pred.append(sample.reshape((1, *sample.shape)), axis=0)
-                for scale_level, (embedding, _) in predictions.items():
-                    sample = embedding.detach().cpu().numpy()[0]
-                    dataset_name = f"emb_s{scale_level}"
-                    if dataset_name not in snapshot_zarr:
-                        snapshot_pred = snapshot_zarr.create_dataset(
-                            dataset_name,
-                            shape=(0, *sample.shape),
-                            dtype=sample.dtype,
-                        )
-                        snapshot_pred.attrs["resolution"] = (
-                            raws[scale_level].spec.voxel_size / 2
-                        )
-                        snapshot_pred.attrs["offset"] = raws[
-                            scale_level
-                        ].spec.roi.offset
-                        snapshot_pred.attrs["axes"] = [
-                            "iteration^",
-                            "c^",
-                            "z",
-                            "y",
-                            "x",
-                        ]
-                    else:
-                        snapshot_pred = snapshot_zarr[dataset_name]
-                    snapshot_pred.append(sample.reshape((1, *sample.shape)), axis=0)
-                for scale_level, weight in enumerate(weights):
-                    dataset_name = f"weight_s{scale_level}"
-                    sample = weight.data[0]
-                    if dataset_name not in snapshot_zarr:
-                        snapshot_weight = snapshot_zarr.create_dataset(
-                            dataset_name,
-                            shape=(0, *sample.shape),
-                            dtype=sample.dtype,
-                        )
-                        snapshot_weight.attrs["resolution"] = weight.spec.voxel_size
-                        snapshot_weight.attrs["offset"] = weight.spec.roi.offset
-                        snapshot_weight.attrs["axes"] = ["iteration^", "z", "y", "x"]
-                    else:
-                        snapshot_weight = snapshot_zarr[dataset_name]
-                    snapshot_weight.append(sample.reshape((1, *sample.shape)), axis=0)
-                for scale_level, weighted_loss in enumerate(weighted_losses):
-                    sample = weighted_loss.detach().cpu().numpy()[0]
-                    dataset_name = f"loss_s{scale_level}"
-                    if dataset_name not in snapshot_zarr:
-                        snapshot_loss = snapshot_zarr.create_dataset(
-                            dataset_name,
-                            shape=(0, *sample.shape),
-                            dtype=sample.dtype,
-                        )
-                        snapshot_loss.attrs["resolution"] = targets[
-                            scale_level
-                        ].spec.voxel_size
-                        snapshot_loss.attrs["offset"] = targets[
-                            scale_level
-                        ].spec.roi.offset
-                        snapshot_loss.attrs["axes"] = ["iteration^", "z", "y", "x"]
-                    else:
-                        snapshot_loss = snapshot_zarr[dataset_name]
-                    snapshot_loss.append(sample.reshape((1, *sample.shape)), axis=0)
-
-            if (
-                train_config.validation_interval > 0
-                and i % train_config.validation_interval == 0
-            ):
-                model = model.eval()
-                # validate
-                with torch.no_grad():
-                    for dataset_ind, dataset_config in enumerate(data_config.datasets):
-                        torch.cuda.empty_cache()
-                        # TODO: What happens when s0 has different resolutions for different datasets?
-                        try:
-                            raw_s0 = daisy.open_ds(
-                                dataset_config.dataset_container,
-                                dataset_config.raw_dataset + f"/s0",
-                            )
-                        except FileExistsError:
-                            raw_s0 = daisy.open_ds(
-                                dataset_config.fallback_dataset_container,
-                                dataset_config.raw_dataset + f"/s0",
-                            )
-                        assert (
-                            raw_s0.voxel_size == data_config.gt_voxel_size * 2
-                        ), f"gt resolution is not double the raw s0 resolution: raw({raw_s0.voxel_size}):gt({data_config.gt_voxel_size})"
-                        for validation_crop in dataset_config.validation_crops:
-                            try:
-                                gt_ds = daisy.open_ds(
-                                    dataset_config.dataset_container,
-                                    dataset_config.gt_dataset.format(
-                                        crop_num=validation_crop
-                                    ),
-                                )
-                            except FileExistsError:
-                                gt_ds = daisy.open_ds(
-                                    dataset_config.fallback_dataset_container,
-                                    dataset_config.gt_dataset.format(
-                                        crop_num=validation_crop
-                                    ),
-                                )
-                            gt_voxel_size = gt_ds.voxel_size
-
-                            # prepare an empty dataset from which we can pull 0's
-                            # in a consistent manner
-                            daisy.prepare_ds(
-                                str(train_config.validation_container),
-                                validation_pred_dataset.format(
-                                    i=i,
-                                    crop=validation_crop,
-                                    scale=scale_config.num_raw_scale_levels,
-                                ),
-                                total_roi=gt_ds.roi.snap_to_grid(
-                                    gt_voxel_size
-                                    * 2 ** (scale_config.num_raw_scale_levels),
-                                    mode="grow",
-                                ),
-                                voxel_size=gt_voxel_size
-                                * 2 ** (scale_config.num_raw_scale_levels),
-                                dtype=np.float32,
-                                num_channels=model_config.n_output_channels,
-                                delete=True,
-                            )
-                            daisy.prepare_ds(
-                                str(train_config.validation_container),
-                                validation_emb_dataset.format(
-                                    i=i,
-                                    crop=validation_crop,
-                                    scale=scale_config.num_raw_scale_levels,
-                                ),
-                                total_roi=gt_ds.roi.snap_to_grid(
-                                    gt_voxel_size
-                                    * 2 ** (scale_config.num_raw_scale_levels),
-                                    mode="grow",
-                                ),
-                                voxel_size=gt_voxel_size
-                                * 2 ** (scale_config.num_raw_scale_levels),
-                                dtype=np.float32,
-                                num_channels=model_config.num_embeddings,
-                                delete=True,
-                            )
-                            for scale_level in range(
-                                scale_config.num_raw_scale_levels - 1, -1, -1
-                            ):
-                                # assumptions:
-                                # 1) raw data is provided as a scale pyramid
-                                # 2) gt data is provided in labels/all
-
-                                try:
-                                    raw_ds = daisy.open_ds(
-                                        dataset_config.dataset_container,
-                                        dataset_config.raw_dataset + f"/s{scale_level}",
-                                    )
-                                except FileExistsError:
-                                    raw_ds = daisy.open_ds(
-                                        dataset_config.fallback_dataset_container,
-                                        dataset_config.raw_dataset + f"/s{scale_level}",
-                                    )
-                                raw_voxel_size = raw_ds.voxel_size
-
-                                raw_key, upsampled_key, pred_key, emb_key = (
-                                    gp.ArrayKey("RAW"),
-                                    gp.ArrayKey("UPSAMPLED"),
-                                    gp.ArrayKey("PRED"),
-                                    gp.ArrayKey("EMB"),
-                                )
-                                input_size = (
-                                    train_config.eval_input_shape_voxels
-                                    * raw_voxel_size
-                                )
-                                output_size = input_size
-                                reference_request = gp.BatchRequest()
-                                reference_request.add(
-                                    raw_key,
-                                    input_size,
-                                )
-                                reference_request.add(
-                                    upsampled_key,
-                                    input_size,
-                                )
-                                reference_request.add(
-                                    pred_key,
-                                    output_size,
-                                )
-                                if model_config.embeddings:
-                                    reference_request.add(emb_key, output_size)
-                                out_voxel_size = raw_voxel_size / 2
-                                out_roi = gt_ds.roi.snap_to_grid(
-                                    raw_voxel_size, mode="grow"
-                                )
-                                if any(
-                                    [a < b for a, b in zip(out_roi.shape, input_size)]
-                                ):
-                                    context = (
-                                        gp.Coordinate(
-                                            *(
-                                                max(out_shape - gt_shape, 0)
-                                                for gt_shape, out_shape in zip(
-                                                    out_roi.shape, output_size
-                                                )
-                                            )
-                                        )
-                                        + 1
-                                    ) / 2
-                                    out_roi = out_roi.grow(
-                                        context, context
-                                    ).snap_to_grid(raw_voxel_size, mode="grow")
-
-                                out_offset = Coordinate(
-                                    max(a, b)
-                                    for a, b in zip(out_roi.offset, raw_ds.roi.offset)
-                                )
-                                out_offset += (-out_offset) % out_voxel_size
-                                out_roi.offset = out_offset
-
-                                val_pipeline = (
-                                    (
-                                        gp.ZarrSource(
-                                            str(dataset_config.dataset_container),
-                                            {raw_key: f"volumes/raw/s{scale_level}"},
-                                            array_specs={
-                                                raw_key: gp.ArraySpec(
-                                                    roi=raw_ds.roi,
-                                                    voxel_size=raw_ds.voxel_size,
-                                                    interpolatable=True,
-                                                )
-                                            },
-                                        )
-                                        + gp.Normalize(raw_key),
-                                        gp.ZarrSource(
-                                            str(train_config.validation_container),
-                                            {
-                                                upsampled_key: (
-                                                    validation_pred_dataset
-                                                    if not model_config.embeddings
-                                                    else validation_emb_dataset
-                                                ).format(
-                                                    i=i,
-                                                    crop=validation_crop,
-                                                    scale=scale_level + 1,
-                                                )
-                                            },
-                                        )
-                                        + gp.Pad(upsampled_key, None),
-                                    )
-                                    + gp.MergeProvider()
-                                    + gp.Unsqueeze([raw_key])
-                                    + gp.Unsqueeze([raw_key, upsampled_key])
-                                    + Predict(
-                                        model=model,
-                                        inputs={
-                                            "raw": raw_key,
-                                            "upsampled": upsampled_key,
-                                        },
-                                        outputs={0: emb_key, 1: pred_key},
-                                        array_specs={
-                                            pred_key: gp.ArraySpec(
-                                                roi=out_roi,
-                                                voxel_size=out_voxel_size,
-                                                dtype=np.float32,
-                                            ),
-                                            emb_key: gp.ArraySpec(
-                                                roi=out_roi,
-                                                voxel_size=out_voxel_size,
-                                                dtype=np.float32,
-                                            ),
-                                        },
-                                    )
-                                    + gp.Squeeze([raw_key, emb_key, pred_key])
-                                    + gp.Squeeze([raw_key])
-                                    + gp.ZarrWrite(
-                                        dataset_names={
-                                            pred_key: validation_pred_dataset.format(
-                                                i=i,
-                                                crop=validation_crop,
-                                                scale=scale_level,
-                                            ),
-                                            emb_key: validation_emb_dataset.format(
-                                                i=i,
-                                                crop=validation_crop,
-                                                scale=scale_level,
-                                            ),
-                                            raw_key: validation_raw_dataset.format(
-                                                crop=validation_crop,
-                                                scale=scale_level,
-                                            ),
-                                        },
-                                        output_dir=str(
-                                            train_config.validation_container.parent
-                                        ),
-                                        output_filename=train_config.validation_container.name,
-                                    )
-                                    + gp.Scan(reference=reference_request)
-                                )
-
-                                # prepare the dataset to be written to
-                                pred_ds = daisy.prepare_ds(
-                                    str(train_config.validation_container),
-                                    validation_pred_dataset.format(
-                                        i=i,
-                                        crop=validation_crop,
-                                        scale=scale_level,
-                                    ),
-                                    total_roi=out_roi,
-                                    voxel_size=out_voxel_size,
-                                    dtype=np.float32,
-                                    write_size=output_size,
-                                    num_channels=model_config.n_output_channels,
-                                    delete=True,
-                                )
-
-                                # prepare emb ds
-                                daisy.prepare_ds(
-                                    str(train_config.validation_container),
-                                    validation_emb_dataset.format(
-                                        i=i,
-                                        crop=validation_crop,
-                                        scale=scale_level,
-                                    ),
-                                    total_roi=out_roi,
-                                    voxel_size=out_voxel_size,
-                                    dtype=np.float32,
-                                    write_size=output_size,
-                                    num_channels=model_config.num_embeddings,
-                                    delete=True,
-                                )
-                                # prepare raw ds
-                                daisy.prepare_ds(
-                                    str(train_config.validation_container),
-                                    validation_raw_dataset.format(
-                                        crop=validation_crop,
-                                        scale=scale_level,
-                                    ),
-                                    total_roi=out_roi,
-                                    voxel_size=raw_voxel_size,
-                                    dtype=np.float32,
-                                    write_size=output_size,
-                                    num_channels=None,
-                                    delete=True,
-                                )
-
-                                with gp.build(val_pipeline):
-                                    val_pipeline.request_batch(gp.BatchRequest())
-
-                            # compare prediction s0 to gt
-                            gt_data = gt_ds.to_ndarray(gt_ds.roi)
-                            label_data = np.zeros_like(gt_data)
-                            for label, label_ids in enumerate(data_config.categories):
-                                label_data[np.isin(gt_data, label_ids)] = label + 1
-                            pred_data = pred_ds.to_ndarray(pred_ds.roi)
-                            pred_data = np.argmax(pred_data, axis=0)
-
-                            val_score = f1_score(
-                                label_data.flatten(),
-                                pred_data.flatten(),
-                                average=None,
-                            )
-                            print(
-                                f"Iteration: {i}, crop: {validation_crop}, f1_score: {val_score}"
-                            )
-                            val_stats.append(val_score)
-                            with train_config.val_file.open("w") as f:
-                                f.write("\n".join([str(x) for x in val_stats]))
-
-                model = model.train()
-
-
-@v1.command()
-@click.option("-m", "--model-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-s", "--scale-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-d", "--data-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-t", "--train-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-i", "--iteration", type=int)
-def validate(model_config, scale_config, data_config, train_config, iteration):
-    from contextnet.configs import ScaleConfig, DataConfig, TrainConfig, BackboneConfig
-    from contextnet.backbones.dense import DenseNet
-    from contextnet.pipeline import build_pipeline, get_request, split_batch
-
-    from funlib.geometry import Coordinate
-
-    import gunpowder as gp
-    import daisy
-
-    from sklearn.metrics import f1_score
-    from tqdm import tqdm
-    import zarr
-    import torch
-    import numpy as np
-
-    assert torch.cuda.is_available(), "Cannot validate reasonably without cuda!"
-
-    scale_config = ScaleConfig(**yaml.safe_load(open(scale_config, "r").read()))
-    model_config = BackboneConfig(**yaml.safe_load(open(model_config, "r").read()))
-    train_config = TrainConfig(**yaml.safe_load(open(train_config, "r").read()))
-    data_config = DataConfig(**yaml.safe_load(open(data_config, "r").read()))
-
-    model = DenseNet(
-        n_input_channels=model_config.raw_input_channels
-        + (
-            model_config.n_output_channels
-            if not model_config.embeddings
-            else model_config.num_embeddings
-        ),
-        n_output_channels=model_config.n_output_channels,
-        num_init_features=model_config.num_init_features,
-        num_embeddings=model_config.num_embeddings,
-        growth_rate=model_config.growth_rate,
-        block_config=model_config.block_config,
-        padding=model_config.padding,
-        upsample_mode=model_config.upsample_mode,
-    ).cuda()
-
-    torch.backends.cudnn.benchmark = True
-
-    checkpoint = train_config.checkpoint_dir / f"{iteration}"
-    assert checkpoint.exists()
-    weights = torch.load(checkpoint)
-    model.load_state_dict(weights)
-
-    # paths
-    validation_pred_dataset = "volumes/val/{crop}/{i}/pred/scale_{scale}"
-    validation_emb_dataset = "volumes/val/{crop}/{i}/emb/scale_{scale}"
-    validation_raw_dataset = "volumes/val/{crop}/raw/scale_{scale}"
-
-    model = model.eval()
-    # validate
-    with torch.no_grad():
-        for dataset_config in data_config.datasets:
-            # TODO: What happens when s0 has different resolutions for different datasets?
-            try:
-                raw_s0 = daisy.open_ds(
-                    dataset_config.dataset_container,
-                    dataset_config.raw_dataset + f"/s0",
-                )
-            except FileExistsError:
-                raw_s0 = daisy.open_ds(
-                    dataset_config.fallback_dataset_container,
-                    dataset_config.raw_dataset + f"/s0",
-                )
-            assert (
-                raw_s0.voxel_size == data_config.gt_voxel_size * 2
-            ), f"gt resolution is not double the raw s0 resolution: raw({raw_s0.voxel_size}):gt({data_config.gt_voxel_size})"
-            for validation_crop in dataset_config.validation_crops:
-                try:
-                    gt_ds = daisy.open_ds(
-                        dataset_config.dataset_container,
-                        dataset_config.gt_group.format(crop_num=validation_crop)
-                        + "/all",
-                    )
-                except FileExistsError:
-                    gt_ds = daisy.open_ds(
-                        dataset_config.fallback_dataset_container,
-                        dataset_config.gt_group.format(crop_num=validation_crop)
-                        + "/all",
-                    )
-                gt_voxel_size = gt_ds.voxel_size
-
-                # prepare an empty dataset from which we can pull 0's
-                # in a consistent manner
-                daisy.prepare_ds(
-                    str(train_config.validation_container),
-                    validation_pred_dataset.format(
-                        i=iteration,
-                        crop=validation_crop,
-                        scale=scale_config.num_raw_scale_levels,
-                    ),
-                    total_roi=gt_ds.roi.snap_to_grid(
-                        gt_voxel_size * 2 ** (scale_config.num_raw_scale_levels),
-                        mode="grow",
-                    ),
-                    voxel_size=gt_voxel_size * 2 ** (scale_config.num_raw_scale_levels),
-                    dtype=np.float32,
-                    num_channels=model_config.n_output_channels,
-                    delete=True,
-                )
-                daisy.prepare_ds(
-                    str(train_config.validation_container),
-                    validation_emb_dataset.format(
-                        i=iteration,
-                        crop=validation_crop,
-                        scale=scale_config.num_raw_scale_levels,
-                    ),
-                    total_roi=gt_ds.roi.snap_to_grid(
-                        gt_voxel_size * 2 ** (scale_config.num_raw_scale_levels),
-                        mode="grow",
-                    ),
-                    voxel_size=gt_voxel_size * 2 ** (scale_config.num_raw_scale_levels),
-                    dtype=np.float32,
-                    num_channels=model_config.num_embeddings,
-                    delete=True,
-                )
-                for scale_level in range(scale_config.num_raw_scale_levels - 1, -1, -1):
-                    # assumptions:
-                    # 1) raw data is provided as a scale pyramid
-                    # 2) gt data is provided in labels/all
-
-                    try:
-                        raw_ds = daisy.open_ds(
-                            dataset_config.dataset_container,
-                            dataset_config.raw_dataset + f"/s{scale_level}",
-                        )
-                    except FileExistsError:
-                        raw_ds = daisy.open_ds(
-                            dataset_config.fallback_dataset_container,
-                            dataset_config.raw_dataset + f"/s{scale_level}",
-                        )
-                    raw_voxel_size = raw_ds.voxel_size
-
-                    raw_key, upsampled_key, pred_key, emb_key = (
-                        gp.ArrayKey("RAW"),
-                        gp.ArrayKey("UPSAMPLED"),
-                        gp.ArrayKey("PRED"),
-                        gp.ArrayKey("EMB"),
-                    )
-                    input_size = train_config.eval_input_shape_voxels * raw_voxel_size
-                    output_size = input_size
-                    reference_request = gp.BatchRequest()
-                    reference_request.add(
-                        raw_key,
-                        input_size,
-                    )
-                    reference_request.add(
-                        upsampled_key,
-                        input_size,
-                    )
-                    reference_request.add(
-                        pred_key,
-                        output_size,
-                    )
-                    if model_config.embeddings:
-                        reference_request.add(emb_key, output_size)
-                    out_voxel_size = raw_voxel_size / 2
-                    out_roi = gt_ds.roi.snap_to_grid(raw_voxel_size, mode="grow")
-                    if any([a < b for a, b in zip(out_roi.shape, input_size)]):
-                        context = (
-                            gp.Coordinate(
-                                *(
-                                    max(out_shape - gt_shape, 0)
-                                    for gt_shape, out_shape in zip(
-                                        out_roi.shape, output_size
-                                    )
-                                )
-                            )
-                            + 1
-                        ) / 2
-                        out_roi = out_roi.grow(context, context).snap_to_grid(
-                            raw_voxel_size, mode="grow"
-                        )
-
-                    out_offset = Coordinate(
-                        max(a, b) for a, b in zip(out_roi.offset, raw_ds.roi.offset)
-                    )
-                    out_offset += (-out_offset) % out_voxel_size
-                    out_roi.offset = out_offset
-
-                    val_pipeline = (
-                        (
-                            gp.ZarrSource(
-                                str(dataset_config.dataset_container),
-                                {raw_key: f"volumes/raw/s{scale_level}"},
-                                array_specs={
-                                    raw_key: gp.ArraySpec(
-                                        roi=raw_ds.roi,
-                                        voxel_size=raw_ds.voxel_size,
-                                        interpolatable=True,
-                                    )
-                                },
-                            )
-                            + gp.Normalize(raw_key),
-                            gp.ZarrSource(
-                                str(train_config.validation_container),
-                                {
-                                    upsampled_key: (
-                                        validation_pred_dataset
-                                        if not model_config.embeddings
-                                        else validation_emb_dataset
-                                    ).format(
-                                        i=iteration,
-                                        crop=validation_crop,
-                                        scale=scale_level + 1,
-                                    )
-                                },
-                            )
-                            + gp.Pad(upsampled_key, None),
-                        )
-                        + gp.MergeProvider()
-                        + gp.Unsqueeze([raw_key])
-                        + gp.Unsqueeze([raw_key, upsampled_key])
-                        + Predict(
-                            model=model,
-                            inputs={
-                                "raw": raw_key,
-                                "upsampled": upsampled_key,
-                            },
-                            outputs={0: emb_key, 1: pred_key},
-                            array_specs={
-                                pred_key: gp.ArraySpec(
-                                    roi=out_roi,
-                                    voxel_size=out_voxel_size,
-                                    dtype=np.float32,
-                                ),
-                                emb_key: gp.ArraySpec(
-                                    roi=out_roi,
-                                    voxel_size=out_voxel_size,
-                                    dtype=np.float32,
-                                ),
-                            },
-                        )
-                        + gp.Squeeze([raw_key, emb_key, pred_key])
-                        + gp.Squeeze([raw_key])
-                        + gp.ZarrWrite(
-                            dataset_names={
-                                pred_key: validation_pred_dataset.format(
-                                    i=iteration,
-                                    crop=validation_crop,
-                                    scale=scale_level,
-                                ),
-                                emb_key: validation_emb_dataset.format(
-                                    i=iteration,
-                                    crop=validation_crop,
-                                    scale=scale_level,
-                                ),
-                                raw_key: validation_raw_dataset.format(
-                                    crop=validation_crop,
-                                    scale=scale_level,
-                                ),
-                            },
-                            output_dir=str(train_config.validation_container.parent),
-                            output_filename=train_config.validation_container.name,
-                        )
-                        + gp.Scan(reference=reference_request)
-                    )
-
-                    # prepare the dataset to be written to
-                    pred_ds = daisy.prepare_ds(
-                        str(train_config.validation_container),
-                        validation_pred_dataset.format(
-                            i=iteration,
-                            crop=validation_crop,
-                            scale=scale_level,
-                        ),
-                        total_roi=out_roi,
-                        voxel_size=out_voxel_size,
-                        dtype=np.float32,
-                        write_size=output_size,
-                        num_channels=model_config.n_output_channels,
-                        delete=True,
-                    )
-
-                    # prepare emb ds
-                    daisy.prepare_ds(
-                        str(train_config.validation_container),
-                        validation_emb_dataset.format(
-                            i=iteration,
-                            crop=validation_crop,
-                            scale=scale_level,
-                        ),
-                        total_roi=out_roi,
-                        voxel_size=out_voxel_size,
-                        dtype=np.float32,
-                        write_size=output_size,
-                        num_channels=model_config.num_embeddings,
-                        delete=True,
-                    )
-                    # prepare raw ds
-                    daisy.prepare_ds(
-                        str(train_config.validation_container),
-                        validation_raw_dataset.format(
-                            crop=validation_crop,
-                            scale=scale_level,
-                        ),
-                        total_roi=out_roi,
-                        voxel_size=raw_voxel_size,
-                        dtype=np.float32,
-                        write_size=output_size,
-                        num_channels=None,
-                        delete=True,
-                    )
-
-                    with gp.build(val_pipeline):
-                        val_pipeline.request_batch(gp.BatchRequest())
-
-                # compare prediction s0 to gt
-                gt_data = gt_ds.to_ndarray(gt_ds.roi)
-                label_data = np.zeros_like(gt_data)
-                for label, label_ids in enumerate(data_config.categories):
-                    label_data[np.isin(gt_data, label_ids)] = label + 1
-                pred_data = pred_ds.to_ndarray(pred_ds.roi)
-                pred_data = np.argmax(pred_data, axis=0)
-
-                val_score = f1_score(
-                    label_data.flatten(),
-                    pred_data.flatten(),
-                    average=None,
-                )
-                print(
-                    f"Iteration: {iteration}, crop: {validation_crop}, f1_score: {val_score}"
-                )

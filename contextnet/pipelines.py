@@ -1,12 +1,14 @@
-from .configs import DataConfig, ScaleConfig
+from .configs import DataConfig, ScaleConfig, DataSetConfig
 
 import gunpowder as gp
 import daisy
 from funlib.geometry import Coordinate, Roi
 from lsd.gp.add_local_shape_descriptor import AddLocalShapeDescriptor
+from fibsem_tools.metadata.groundtruth import Label, LabelList
 
 import numpy as np
 import zarr
+import yaml
 
 from pathlib import Path
 from collections import defaultdict
@@ -153,27 +155,30 @@ def get_datasets(dataset_config) -> list[dict[str, daisy.Array]]:
     # filter out crops to which we can't find the ground truth
     def crop_exists(dataset_config, crop_num: int) -> bool:
         return (
-            dataset_config.dataset_container
-            / dataset_config.gt_group.format(crop_num=crop_num)
-        ).exists() or (
-            dataset_config.fallback_dataset_container
-            / dataset_config.gt_group.format(crop_num=crop_num)
-        ).exists()
+            Path(
+                dataset_config.raw.container.format(dataset=dataset_config.name),
+                dataset_config.raw.crop.format(crop_num=crop_num, organelle=""),
+            ).exists()
+            or Path(
+                dataset_config.raw.fallback.format(dataset=dataset_config.name),
+                dataset_config.raw.crop.format(crop_num=crop_num, organelle=""),
+            ).exists()
+        )
 
     def get_dataset_container_group(dataset_config, crop_num):
         return (
-            dataset_config.dataset_container
-            if (
-                dataset_config.dataset_container
-                / dataset_config.gt_group.format(crop_num=crop_num)
+            dataset_config.raw.container.format(dataset=dataset_config.name)
+            if Path(
+                dataset_config.raw.container.format(dataset=dataset_config.name)
+                , dataset_config.raw.crop.format(crop_num=crop_num, organelle="")
             ).exists()
-            else dataset_config.fallback_dataset_container,
-            dataset_config.gt_group.format(crop_num=crop_num),
+            else dataset_config.raw.fallback.format(dataset=dataset_config.name),
+            dataset_config.raw.crop.format(crop_num=crop_num, organelle=""),
         )
 
     containers = [
         get_dataset_container_group(dataset_config, crop_num)
-        for crop_num in dataset_config.training_crops
+        for crop_num in dataset_config.training
         if crop_exists(dataset_config, crop_num)
     ]
 
@@ -192,8 +197,28 @@ def get_datasets(dataset_config) -> list[dict[str, daisy.Array]]:
         group.visititems(store_array)
         return arrays
 
-    training_datasets: list[dict[str, daisy.Array]] = [
-        get_organelle_datasets(container, group) for container, group in containers
+    def get_label_list(container:Path, group_name):
+        try:
+            group = zarr.open(container, "r")[group_name]
+        except KeyError as e:
+            print(container, group)
+            raise e
+        labels = {}
+
+        def store_array(k, v):
+            if isinstance(v, zarr.Array):
+                for label in v.attrs["labels"]:
+                    label = Label(**label)
+                    if label.value in labels:
+                        pass
+                    else:
+                        labels[label.value] = label
+
+        group.visititems(store_array)
+        return arrays
+
+    training_datasets: list[tuple[dict[str, daisy.Array], LabelList]] = [
+        get_organelle_datasets(container, group), get_label_list(container, group) for container, group in containers
     ]
 
     return training_datasets
@@ -210,7 +235,10 @@ def build_pipeline(
     gt_scale_levels = range(scale_config.num_gt_scale_levels)
 
     resolution_pipelines = defaultdict(lambda: list())
-    for dataset_config in data_config.datasets:
+    for dataset_config_path in data_config.datasets:
+        dataset_config = DataSetConfig(
+            **yaml.safe_load(dataset_config_path.open("r").read())
+        )
 
         training_datasets = get_datasets(dataset_config)
         # open training crops as daisy arrays
@@ -250,11 +278,11 @@ def build_pipeline(
         )
 
         raw_group_path = Path(
-            f"{dataset_config.dataset_container}/{dataset_config.raw_dataset}"
-        )
+            f"{dataset_config.raw.container.format(dataset=dataset_config.name)}/{dataset_config.raw.dataset.format(level=0)}"
+        ).parent
         raw_group_fallback_path = Path(
-            f"{dataset_config.fallback_dataset_container}/{dataset_config.raw_dataset}"
-        )
+            f"{dataset_config.raw.fallback.format(dataset=dataset_config.name)}/{dataset_config.raw.dataset.format(level=0)}"
+        ).parent
         raw_scale_levels = [
             int(ds.name[1:])
             for ds in (
@@ -266,16 +294,16 @@ def build_pipeline(
         # get raw container
         raw_dataset_list = [
             daisy.open_ds(
-                f"{dataset_config.dataset_container}",
-                f"{dataset_config.raw_dataset}/s{scale_level}",
+                f"{dataset_config.raw.container.format(dataset=dataset_config.name)}",
+                f"{dataset_config.raw.dataset.format(level=scale_level)}",
             )
             if Path(
-                f"{dataset_config.dataset_container}",
-                f"{dataset_config.raw_dataset}/s{scale_level}",
+                f"{dataset_config.raw.container.format(dataset=dataset_config.name)}",
+                f"{dataset_config.raw.dataset.format(level=scale_level)}",
             ).exists()
             else daisy.open_ds(
-                f"{dataset_config.fallback_dataset_container}",
-                f"{dataset_config.raw_dataset}/s{scale_level}",
+                f"{dataset_config.raw.fallback.format(dataset=dataset_config.name)}",
+                f"{dataset_config.raw.dataset.format(level=scale_level)}",
             )
             for scale_level in raw_scale_levels
         ]

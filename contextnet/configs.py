@@ -1,8 +1,10 @@
 from funlib.geometry import Coordinate
 
 from pydantic import BaseModel
+import yaml
 
 from pathlib import Path
+from typing import Optional
 
 
 class PydanticCoordinate(Coordinate):
@@ -26,6 +28,45 @@ class BackboneConfig(BaseModel):
     embeddings: bool
     upsample_mode: str
 
+    @property
+    def context(self):
+        return sum(self.block_config)
+
+
+class ScaleConfig(BaseModel):
+    scale_factor: PydanticCoordinate
+    num_raw_scale_levels: int
+    num_gt_scale_levels: int
+    num_eval_scale_levels: int
+
+
+class StorageConfig(BaseModel):
+    dataset: str = "volumes/raw/s{level}"
+    crop: str = "volumes/groundtruth/crop{crop_num}/labels/{organelle}"
+    container: str = "/groups/cellmap/cellmap/data/{dataset}/{dataset}.n5"
+    fallback: str = "/nrs/cellmap/pattonw/data/tmp_data/{dataset}/{dataset}.n5"
+
+
+class DataSetConfig(BaseModel):
+    name: str
+    raw: StorageConfig = StorageConfig()
+    training: list[int]
+    validation: list[int]
+
+
+class DataConfig(BaseModel):
+    categories: list[list[int]]
+    organelles: dict[str, int] = {}
+    datasets: list[Path]
+    min_volume_size: int
+    zero_pad: int
+    gt_voxel_size: PydanticCoordinate  # assumed to be half the raw voxel size
+
+    @property
+    def dataset_configs(self) -> list[DataSetConfig]:
+        for dataset in self.datasets:
+            yield (DataSetConfig(**yaml.safe_load(dataset.open("r").read())))
+
 
 class TrainConfig(BaseModel):
     input_shape_voxels: PydanticCoordinate
@@ -45,27 +86,24 @@ class TrainConfig(BaseModel):
     learning_rate: float
     threshold_skew: int
     lsds: bool
+    scale_config_file: Path
+    data_config_file: Path
+    architecture_config_file: Path
+    start: Optional[Path] = None
+    sample_voxel_size: bool = False
+    use_organelle_vols: bool = False
+    scale_as_input: bool = False
 
+    @property
+    def scale_config(self) -> ScaleConfig:
+        return ScaleConfig(**yaml.safe_load(self.scale_config_file.open("r").read()))
 
-class ScaleConfig(BaseModel):
-    scale_factor: PydanticCoordinate
-    num_raw_scale_levels: int
-    num_gt_scale_levels: int
+    @property
+    def data_config(self) -> DataConfig:
+        return DataConfig(**yaml.safe_load(self.data_config_file.open("r").read()))
 
-
-class DataSetConfig(BaseModel):
-    dataset_container: Path
-    fallback_dataset_container: Path
-    raw_dataset: str
-    gt_group: str
-    training_crops: list[int]
-    validation_crops: list[int]
-
-
-class DataConfig(BaseModel):
-    datasets: list[DataSetConfig]
-    min_volume_size: int
-    zero_pad: int
-    gt_voxel_size: PydanticCoordinate  # assumed to be half the raw voxel size
-    categories: list[list[int]]
-    organelles: dict[str, int] = {}
+    @property
+    def architecture_config(self) -> BackboneConfig:
+        return BackboneConfig(
+            **yaml.safe_load(self.architecture_config_file.open("r").read())
+        )

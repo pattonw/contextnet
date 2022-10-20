@@ -1,60 +1,54 @@
 import click
-import yaml
 
 
 @click.command()
 @click.option("-t", "--train-config", type=click.Path(exists=True, dir_okay=False))
 @click.option("-v", "--num-voxels", type=int, default=32)
-@click.option("--lsds/--no-lsds", type=bool, default=False)
-def visualize_pipeline(train_config, num_voxels, lsds):
-    from contextnet.pipelines import build_pipeline, get_request, split_batch
+def visualize_pipeline(train_config, num_voxels):
+    from contextnet.pipeline import build_pipeline, get_request, split_batch
     from contextnet.configs import TrainConfig
 
     from funlib.geometry import Coordinate
+
     import gunpowder as gp
 
     import neuroglancer
 
-    import numpy as np
+    import yaml
 
+    train_config = TrainConfig(**yaml.safe_load(open(train_config, "r").read()))
     scale_config = train_config.scale_config
     data_config = train_config.data_config
-    pipeline = (
-        build_pipeline(
-            data_config,
-            scale_config,
-            gt_voxel_size=data_config.gt_voxel_size,
-            lsds=lsds,
-        )
-        + gp.PrintProfilingStats()
+
+    lsds = train_config.lsds
+
+    pipeline = build_pipeline(
+        data_config,
+        scale_config,
+        lsds=lsds,
+        sample_voxel_sizes=train_config.sample_voxel_size,
+        use_organelle_datasets=train_config.use_organelle_vols,
     )
 
     volume_shape = Coordinate((num_voxels,) * 3)
 
     def load_batch(event):
-        print("fetching batch")
         with gp.build(pipeline):
             batch = pipeline.request_batch(
                 get_request(volume_shape, scale_config, lsds=lsds)
             )
-        print("Got batch")
         if lsds:
-            raw, gt, weights, _lsds, _lsd_mask = split_batch(
+            raw, gt, weights, _masks, _lsds, _lsd_mask, scale = split_batch(
                 batch, scale_config, lsds=lsds
             )
-            raw_names, gt_names, weight_names, lsd_names = (
-                ["raw_high", "raw_low", "raw_context"],
-                ["gt_high", "gt_low"],
-                ["weight_high", "weight_low"],
-                ["lsd_high", "lsd_low"],
-            )
         else:
-            raw, gt, weights = split_batch(batch, scale_config, lsds=lsds)
-            raw_names, gt_names, weight_names = (
-                ["raw_high", "raw_low", "raw_context"],
-                ["gt_high", "gt_low"],
-                ["weight_high", "weight_low"],
-            )
+            raw, gt, weights, _masks, scale = split_batch(batch, scale_config, lsds=lsds)
+
+        print(scale.data.item())
+
+        raw_layers = []
+        gt_layers = []
+        weight_layers = []
 
         with viewer.txn() as s:
             while len(s.layers) > 0:
@@ -62,7 +56,7 @@ def visualize_pipeline(train_config, num_voxels, lsds):
 
             # reverse order for raw so we can set opacity to 1, this
             # way higher res raw replaces low res when available
-            for name, raw_scale_array in zip(raw_names, raw):
+            for scale_level, raw_scale_array in list(enumerate(raw))[::-1]:
 
                 dims = neuroglancer.CoordinateSpace(
                     names=["z", "y", "x"],
@@ -72,59 +66,57 @@ def visualize_pipeline(train_config, num_voxels, lsds):
 
                 raw_vol = neuroglancer.LocalVolume(
                     data=raw_scale_array.data,
-                    voxel_offset=(
-                        (-raw_scale_array.spec.roi.shape / 2)
-                        / raw_scale_array.spec.voxel_size
+                    voxel_offset=raw_scale_array.spec.roi.offset
+                    / raw_scale_array.spec.voxel_size,
+                    dimensions=dims,
+                )
+
+                s.layers[f"raw_s{scale_level}"] = neuroglancer.ImageLayer(
+                    source=raw_vol, opacity=1.0
+                )
+                raw_layers.append(f"raw_s{scale_level}")
+            for scale_level, gt_scale_array in enumerate(gt):
+                dims = neuroglancer.CoordinateSpace(
+                    names=["c^", "z", "y", "x"],
+                    units="nm",
+                    scales=(1,) + tuple(gt_scale_array.spec.voxel_size),
+                )
+                gt_vol = neuroglancer.LocalVolume(
+                    data=gt_scale_array.data,
+                    voxel_offset=(0,)
+                    + tuple(
+                        gt_scale_array.spec.roi.offset / gt_scale_array.spec.voxel_size
                     ),
                     dimensions=dims,
                 )
 
-                s.layers[name] = neuroglancer.ImageLayer(source=raw_vol, opacity=1.0)
-            for name, gt_scale_array in zip(gt_names, gt):
-                dims = neuroglancer.CoordinateSpace(
-                    names=["z", "y", "x"],
-                    units="nm",
-                    scales=gt_scale_array.spec.voxel_size,
-                )
-                gt_vol = neuroglancer.LocalVolume(
-                    data=np.argmax(
-                        np.stack(
-                            [
-                                np.zeros_like(gt_scale_array.data[0]),
-                                *gt_scale_array.data,
-                            ]
-                        ),
-                        axis=0,
-                    ).astype(np.uint32),
-                    voxel_offset=(-gt_scale_array.spec.roi.shape / 2)
-                    / gt_scale_array.spec.voxel_size,
-                    dimensions=dims,
-                )
-
-                s.layers[name] = neuroglancer.SegmentationLayer(
+                s.layers[f"gt_s{scale_level}"] = neuroglancer.ImageLayer(
                     source=gt_vol,
                 )
-            for name, weight_scale_array in zip(weight_names, weights):
+                gt_layers.append(f"gt_s{scale_level}")
+            for scale_level, weight_scale_array in enumerate(weights):
                 dims = neuroglancer.CoordinateSpace(
                     names=["c^", "z", "y", "x"],
                     units="nm",
                     scales=(1,) + tuple(weight_scale_array.spec.voxel_size),
                 )
-                gt_vol = neuroglancer.LocalVolume(
+                weight_vol = neuroglancer.LocalVolume(
                     data=weight_scale_array.data,
                     voxel_offset=(0,)
                     + tuple(
-                        (-weight_scale_array.spec.roi.shape / 2)
+                        weight_scale_array.spec.roi.offset
                         / weight_scale_array.spec.voxel_size
                     ),
                     dimensions=dims,
                 )
 
-                s.layers[name] = neuroglancer.ImageLayer(
-                    source=gt_vol,
+                s.layers[f"weight_s{scale_level}"] = neuroglancer.ImageLayer(
+                    source=weight_vol,
                 )
+                weight_layers.append(f"weight_s{scale_level}")
             if lsds:
-                for name, lsd_scale_array in zip(lsd_names, _lsds):
+                raise NotImplementedError(lsds)
+                for scale_level, lsd_scale_array in enumerate(_lsds):
                     dims = neuroglancer.CoordinateSpace(
                         names=["c^", "z", "y", "x"],
                         units="nm",
@@ -134,34 +126,30 @@ def visualize_pipeline(train_config, num_voxels, lsds):
                         data=lsd_scale_array.data,
                         voxel_offset=(0,)
                         + tuple(
-                            (-lsd_scale_array.spec.roi.shape / 2)
+                            lsd_scale_array.spec.roi.offset
                             / lsd_scale_array.spec.voxel_size
                         ),
                         dimensions=dims,
                     )
 
-                    s.layers[name] = neuroglancer.ImageLayer(
+                    s.layers[f"lsd_s{scale_level}"] = neuroglancer.ImageLayer(
                         source=lsd_vol,
                     )
+                    lsd_layers.append(f"lsd_s{scale_level}")
             s.layout = neuroglancer.row_layout(
                 [
                     neuroglancer.column_layout(
                         [
                             neuroglancer.LayerGroupViewer(
-                                layers=raw_names[::-1] + gt_names[::-1]
+                                layers=raw_layers + gt_layers
                             ),
                         ]
                     ),
                     neuroglancer.column_layout(
                         [
                             neuroglancer.LayerGroupViewer(
-                                layers=raw_names[::-1] + weight_names[::-1]
+                                layers=raw_layers + weight_layers
                             ),
-                        ]
-                    ),
-                    neuroglancer.column_layout(
-                        [
-                            neuroglancer.LayerGroupViewer(layers=raw_names[::-1]),
                         ]
                     ),
                 ]

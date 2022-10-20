@@ -2,12 +2,11 @@ import click
 
 
 @click.command()
-@click.option("-s", "--scale-config", type=click.Path(exists=True, dir_okay=False))
 @click.option("-t", "--train-config", type=click.Path(exists=True, dir_okay=False))
 @click.option("--weights/--no-weights", type=bool, default=False)
 @click.option("--loss/--no-loss", type=bool, default=False)
 @click.option("--argmax/--no-argmax", type=bool, default=False)
-def view_snapshots(scale_config, train_config, weights, loss, argmax):
+def view_snapshots(train_config, weights, loss, argmax):
     from contextnet.configs import ScaleConfig, TrainConfig
 
     import daisy
@@ -18,7 +17,6 @@ def view_snapshots(scale_config, train_config, weights, loss, argmax):
 
     from itertools import chain
 
-    scale_config = ScaleConfig(**yaml.safe_load(open(scale_config, "r").read()))
     train_config = TrainConfig(**yaml.safe_load(open(train_config, "r").read()))
 
     neuroglancer.set_server_bind_address("0.0.0.0")

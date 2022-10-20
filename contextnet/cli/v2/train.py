@@ -3,14 +3,13 @@ import yaml
 
 
 @click.command()
-@click.option("-m", "--model-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-s", "--scale-config", type=click.Path(exists=True, dir_okay=False))
-@click.option("-d", "--data-config", type=click.Path(exists=True, dir_okay=False))
 @click.option("-t", "--train-config", type=click.Path(exists=True, dir_okay=False))
 @click.option("--workers/--no-workers", type=bool, default=True)
-@click.option("-i", "--init-model", type=click.Path(exists=True, dir_okay=False), default=None)
-def train(model_config, scale_config, data_config, train_config, workers, init_model=None):
-    from contextnet.configs import ScaleConfig, DataConfig, TrainConfig, BackboneConfig
+@click.option(
+    "-i", "--init-model", type=click.Path(exists=True, dir_okay=False), default=None
+)
+def train(train_config, workers, init_model=None):
+    from contextnet.configs import TrainConfig
     from contextnet.backbones.dense import DenseNet
     from contextnet.pipelines import build_pipeline, get_request, split_batch
 
@@ -59,10 +58,10 @@ def train(model_config, scale_config, data_config, train_config, workers, init_m
             snapshot_dataset = snapshot_zarr[name]
         snapshot_dataset.append(sample.reshape((1, *sample.shape)), axis=0)
 
-    scale_config = ScaleConfig(**yaml.safe_load(open(scale_config, "r").read()))
-    model_config = BackboneConfig(**yaml.safe_load(open(model_config, "r").read()))
     train_config = TrainConfig(**yaml.safe_load(open(train_config, "r").read()))
-    data_config = DataConfig(**yaml.safe_load(open(data_config, "r").read()))
+    scale_config = train_config.scale_config
+    model_config = train_config.architecture_config
+    data_config = train_config.data_config
 
     model = DenseNet(
         n_input_channels=model_config.raw_input_channels
@@ -86,7 +85,6 @@ def train(model_config, scale_config, data_config, train_config, workers, init_m
             model.load_state_dict(weights)
         except RuntimeError as e:
             print(e)
-
 
     if train_config.loss_file.exists():
         loss_stats = [
